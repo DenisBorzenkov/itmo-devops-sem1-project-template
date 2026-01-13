@@ -2,6 +2,7 @@
 set -e
 
 echo "Start the server"
+cd cmd/app
 go run main.go &
 
 SERVER_PID=$!
