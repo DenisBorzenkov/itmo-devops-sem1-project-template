@@ -2,7 +2,7 @@
 set -e
 
 echo "Start the server"
-go run ./cmd/app/main.go &
+go run main.go &
 
 SERVER_PID=$!
 echo "Server started with PID: $SERVER_PID"
