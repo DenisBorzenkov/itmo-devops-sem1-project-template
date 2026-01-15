@@ -3,6 +3,7 @@ package main
 import (
 	"archive/tar"
 	"archive/zip"
+	"bytes"
 	"database/sql"
 	"encoding/csv"
 	"encoding/json"
@@ -259,7 +260,7 @@ func processCSVData(rc io.Reader, totalItems *int, totalPrice *float64, totalCat
 		}
 	}()
 
-	stmt, err := tx.Prepare("INSERT INTO prices (id, created_at, name, category, price) VALUES ($1, $2, $3, $4, $5)")
+	stmt, err := tx.Prepare("INSERT INTO prices (product_id, created_at, name, category, price) VALUES ($1, $2, $3, $4, $5)")
 	if err != nil {
 		log.Printf("Fail to prepare statement: %v\n", err)
 		return
@@ -269,14 +270,16 @@ func processCSVData(rc io.Reader, totalItems *int, totalPrice *float64, totalCat
 	for _, row := range rows {
 		_, err = stmt.Exec(row.ProductID, row.CreatedAt, row.Name, row.Category, row.Price)
 		if err != nil {
-			log.Printf("Error inserting into DB ID %d: %v\n", row.ProductID, err)
+			log.Printf("Error inserting into DB product_id %d: %v\n", row.ProductID, err)
 			return
 		}
 	}
 
-	*totalItems, *totalCategories, *totalPrice, err = calculateStatistics(tx)
-	if err != nil {
-		log.Printf("Fail to calculate statistics: %v\n", err)
+	// Считаем статистику по текущей загрузке, а не по всей БД
+	*totalItems += len(rows)
+	*totalCategories += len(categorySet)
+	for _, row := range rows {
+		*totalPrice += row.Price
 	}
 }
 
@@ -284,15 +287,8 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 	rows, _ := db.Query("SELECT id, created_at, name, category, price FROM prices")
 	defer rows.Close()
 
-	tempDir := "./temp"
-	os.MkdirAll(tempDir, os.ModePerm)
-	csvFilePath := filepath.Join(tempDir, "data.csv")
-	csvFile, _ := os.Create(csvFilePath)
-	defer csvFile.Close()
-
-	writer := csv.NewWriter(csvFile)
-	writer.Write([]string{"id", "created_at", "name", "category", "price"})
-
+	// Читаем все данные из БД в память
+	var data [][]string
 	for rows.Next() {
 		var id int
 		var createdAt, name, category string
@@ -302,7 +298,7 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Error scanning data", http.StatusInternalServerError)
 			return
 		}
-		writer.Write([]string{strconv.Itoa(id), createdAt, name, category, strconv.Itoa(price)})
+		data = append(data, []string{strconv.Itoa(id), createdAt, name, category, strconv.Itoa(price)})
 	}
 
 	if err := rows.Err(); err != nil {
@@ -311,21 +307,27 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Создаем CSV в памяти
+	csvBuffer := &bytes.Buffer{}
+	writer := csv.NewWriter(csvBuffer)
+	writer.Write([]string{"id", "created_at", "name", "category", "price"})
+	for _, row := range data {
+		writer.Write(row)
+	}
 	writer.Flush()
 
-	zipFilePath := filepath.Join(tempDir, "data.zip")
-	zipFile, _ := os.Create(zipFilePath)
-	defer zipFile.Close()
-
-	zipWriter := zip.NewWriter(zipFile)
+	// Создаем ZIP в памяти
+	zipBuffer := &bytes.Buffer{}
+	zipWriter := zip.NewWriter(zipBuffer)
 	fileInZip, _ := zipWriter.Create("data.csv")
-	csvBytes, _ := os.ReadFile(csvFilePath)
-	fileInZip.Write(csvBytes)
+	fileInZip.Write(csvBuffer.Bytes())
 	zipWriter.Close()
 
+	// Отправляем ZIP из памяти
 	w.Header().Set("Content-Disposition", "attachment; filename=data.zip")
 	w.Header().Set("Content-Type", "application/zip")
-	http.ServeFile(w, r, zipFilePath)
+	w.Header().Set("Content-Length", strconv.Itoa(zipBuffer.Len()))
+	w.Write(zipBuffer.Bytes())
 }
 
 func calculateStatistics(tx *sql.Tx) (int, int, float64, error) {
