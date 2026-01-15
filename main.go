@@ -284,7 +284,12 @@ func processCSVData(rc io.Reader, totalItems *int, totalPrice *float64, totalCat
 }
 
 func handleGet(w http.ResponseWriter, r *http.Request) {
-	rows, _ := db.Query("SELECT id, created_at, name, category, price FROM prices")
+	rows, err := db.Query("SELECT id, created_at, name, category, price FROM prices")
+	if err != nil {
+		log.Printf("Failed to query database: %v\n", err)
+		http.Error(w, "Error querying data", http.StatusInternalServerError)
+		return
+	}
 	defer rows.Close()
 
 	// Читаем все данные из БД в память
@@ -292,13 +297,13 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var id int
 		var createdAt, name, category string
-		var price int
+		var price float64
 		if err := rows.Scan(&id, &createdAt, &name, &category, &price); err != nil {
 			log.Printf("Failed to scan row: %v\n", err)
 			http.Error(w, "Error scanning data", http.StatusInternalServerError)
 			return
 		}
-		data = append(data, []string{strconv.Itoa(id), createdAt, name, category, strconv.Itoa(price)})
+		data = append(data, []string{strconv.Itoa(id), createdAt, name, category, strconv.FormatFloat(price, 'f', -1, 64)})
 	}
 
 	if err := rows.Err(); err != nil {
@@ -310,18 +315,44 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 	// Создаем CSV в памяти
 	csvBuffer := &bytes.Buffer{}
 	writer := csv.NewWriter(csvBuffer)
-	writer.Write([]string{"id", "created_at", "name", "category", "price"})
+	if err := writer.Write([]string{"id", "created_at", "name", "category", "price"}); err != nil {
+		log.Printf("Failed to write CSV header: %v\n", err)
+		http.Error(w, "Error creating CSV", http.StatusInternalServerError)
+		return
+	}
 	for _, row := range data {
-		writer.Write(row)
+		if err := writer.Write(row); err != nil {
+			log.Printf("Failed to write CSV row: %v\n", err)
+			http.Error(w, "Error creating CSV", http.StatusInternalServerError)
+			return
+		}
 	}
 	writer.Flush()
+	if err := writer.Error(); err != nil {
+		log.Printf("CSV writer error: %v\n", err)
+		http.Error(w, "Error creating CSV", http.StatusInternalServerError)
+		return
+	}
 
 	// Создаем ZIP в памяти
 	zipBuffer := &bytes.Buffer{}
 	zipWriter := zip.NewWriter(zipBuffer)
-	fileInZip, _ := zipWriter.Create("data.csv")
-	fileInZip.Write(csvBuffer.Bytes())
-	zipWriter.Close()
+	fileInZip, err := zipWriter.Create("data.csv")
+	if err != nil {
+		log.Printf("Failed to create file in ZIP: %v\n", err)
+		http.Error(w, "Error creating ZIP", http.StatusInternalServerError)
+		return
+	}
+	if _, err := fileInZip.Write(csvBuffer.Bytes()); err != nil {
+		log.Printf("Failed to write to ZIP: %v\n", err)
+		http.Error(w, "Error creating ZIP", http.StatusInternalServerError)
+		return
+	}
+	if err := zipWriter.Close(); err != nil {
+		log.Printf("Failed to close ZIP writer: %v\n", err)
+		http.Error(w, "Error creating ZIP", http.StatusInternalServerError)
+		return
+	}
 
 	// Отправляем ZIP из памяти
 	w.Header().Set("Content-Disposition", "attachment; filename=data.zip")
