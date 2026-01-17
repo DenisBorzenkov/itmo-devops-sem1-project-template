@@ -31,6 +31,8 @@ type ResponseonPost struct {
 	TotalItems      int     `json:"total_items"`
 	TotalCategories int     `json:"total_categories"`
 	TotalPrice      float64 `json:"total_price"`
+	TotalCount      int     `json:"total_count"`
+	DuplicatesCount int     `json:"duplicates_count"`
 }
 
 var db *sql.DB
@@ -41,13 +43,13 @@ func main() {
 		dbHost, dbPort, dbUser, dbPassword, dbName)
 	db, err = sql.Open("postgres", connStr)
 	if err != nil {
-		log.Fatal("Fail to connect to DB", err)
+		log.Panic("Fail to connect to DB", err)
 	}
 	defer db.Close()
 
 	http.HandleFunc("/api/v0/prices", handleRequests)
 	log.Println("Server has started")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Panic(http.ListenAndServe(":8080", nil))
 }
 
 func handleRequests(w http.ResponseWriter, r *http.Request) {
@@ -101,9 +103,10 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 
 	var totalItems int
 	var totalPrice float64
-	var totalCategories int
+	categorySet := make(map[string]bool)
+	var duplicatesCount int
 
-	switch archiveType {
+	switch archiveType:
 	case "zip":
 		zipReader, err := zip.OpenReader(archivePath)
 		if err != nil {
@@ -116,7 +119,7 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 		for _, f := range zipReader.File {
 			if strings.HasSuffix(f.Name, ".csv") {
 				log.Printf("CSV detected: %s\n", f.Name)
-				processCSVFromZip(f, &totalItems, &totalPrice, &totalCategories)
+				processCSVFromZip(f, &totalItems, &totalPrice, categorySet, &duplicatesCount)
 			}
 		}
 
@@ -143,7 +146,7 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 
 			if strings.HasSuffix(header.Name, ".csv") {
 				log.Printf("CSV detected: %s\n", header.Name)
-				processCSVFromTar(tarReader, &totalItems, &totalPrice, &totalCategories)
+				processCSVFromTar(tarReader, &totalItems, &totalPrice, categorySet, &duplicatesCount)
 			}
 		}
 
@@ -152,10 +155,20 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Получаем общее количество записей в БД
+	var totalCount int
+	err = db.QueryRow("SELECT COUNT(*) FROM prices").Scan(&totalCount)
+	if err != nil {
+		log.Printf("Failed to get total count: %v", err)
+		totalCount = 0
+	}
+
 	response := ResponseonPost{
 		TotalItems:      totalItems,
-		TotalCategories: totalCategories,
+		TotalCategories: len(categorySet),
 		TotalPrice:      totalPrice,
+		TotalCount:      totalCount,
+		DuplicatesCount: duplicatesCount,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(response); err != nil {
@@ -173,7 +186,7 @@ type DataRow struct {
 	Price     float64
 }
 
-func processCSVFromZip(f *zip.File, totalItems *int, totalPrice *float64, totalCategories *int) {
+func processCSVFromZip(f *zip.File, totalItems *int, totalPrice *float64, categorySet map[string]bool, duplicatesCount *int) {
 	log.Printf("Starting CSV from ZIP: %s\n", f.Name)
 
 	rc, err := f.Open()
@@ -183,16 +196,16 @@ func processCSVFromZip(f *zip.File, totalItems *int, totalPrice *float64, totalC
 	}
 	defer rc.Close()
 
-	processCSVData(rc, totalItems, totalPrice, totalCategories)
+	processCSVData(rc, totalItems, totalPrice, categorySet, duplicatesCount)
 }
 
-func processCSVFromTar(reader io.Reader, totalItems *int, totalPrice *float64, totalCategories *int) {
+func processCSVFromTar(reader io.Reader, totalItems *int, totalPrice *float64, categorySet map[string]bool, duplicatesCount *int) {
 	log.Println("Starting CSV from TAR")
 
-	processCSVData(reader, totalItems, totalPrice, totalCategories)
+	processCSVData(reader, totalItems, totalPrice, categorySet, duplicatesCount)
 }
 
-func processCSVData(rc io.Reader, totalItems *int, totalPrice *float64, totalCategories *int) {
+func processCSVData(rc io.Reader, totalItems *int, totalPrice *float64, categorySet map[string]bool, duplicatesCount *int) {
 	reader := csv.NewReader(rc)
 
 	header, err := reader.Read()
@@ -203,7 +216,6 @@ func processCSVData(rc io.Reader, totalItems *int, totalPrice *float64, totalCat
 	log.Printf("CSV Header: %v\n", header)
 
 	var rows []DataRow
-	categorySet := make(map[string]bool)
 
 	for {
 		record, err := reader.Read()
@@ -260,7 +272,7 @@ func processCSVData(rc io.Reader, totalItems *int, totalPrice *float64, totalCat
 		}
 	}()
 
-	stmt, err := tx.Prepare("INSERT INTO prices (product_id, created_at, name, category, price) VALUES ($1, $2, $3, $4, $5)")
+	stmt, err := tx.Prepare("INSERT INTO prices (product_id, created_at, name, category, price) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (product_id) DO NOTHING")
 	if err != nil {
 		log.Printf("Fail to prepare statement: %v\n", err)
 		return
@@ -268,16 +280,20 @@ func processCSVData(rc io.Reader, totalItems *int, totalPrice *float64, totalCat
 	defer stmt.Close()
 
 	for _, row := range rows {
-		_, err = stmt.Exec(row.ProductID, row.CreatedAt, row.Name, row.Category, row.Price)
+		result, err := stmt.Exec(row.ProductID, row.CreatedAt, row.Name, row.Category, row.Price)
 		if err != nil {
 			log.Printf("Error inserting into DB product_id %d: %v\n", row.ProductID, err)
 			return
+		}
+		// Проверяем, была ли строка вставлена
+		rowsAffected, _ := result.RowsAffected()
+		if rowsAffected == 0 {
+			*duplicatesCount++
 		}
 	}
 
 	// Считаем статистику по текущей загрузке, а не по всей БД
 	*totalItems += len(rows)
-	*totalCategories += len(categorySet)
 	for _, row := range rows {
 		*totalPrice += row.Price
 	}
