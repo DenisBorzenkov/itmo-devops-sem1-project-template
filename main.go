@@ -106,7 +106,7 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 	categorySet := make(map[string]bool)
 	var duplicatesCount int
 
-	switch archiveType:
+	switch archiveType {
 	case "zip":
 		zipReader, err := zip.OpenReader(archivePath)
 		if err != nil {
